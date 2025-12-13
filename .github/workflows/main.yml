@@ -89,20 +89,32 @@ jobs:
 
             BASE_URL="https://download.mikrotik.com/routeros/$VERSION"
             WORKDIR="$(mktemp -d)"
+            UPLOADS=()
 
             for f in "${FILES[@]}"; do
               FILE="${f/VERSION/$VERSION}"
-              curl -fL "$BASE_URL/$FILE" -o "$WORKDIR/$FILE" \
-                || echo "Skipped: $FILE"
+              TARGET="$WORKDIR/$FILE"
+
+              if curl -fsL "$BASE_URL/$FILE" -o "$TARGET"; then
+                if [ -s "$TARGET" ]; then
+                  UPLOADS+=("$TARGET")
+                  echo "Downloaded: $FILE"
+                else
+                  rm -f "$TARGET"
+                  echo "Skipped (empty): $FILE"
+                fi
+              else
+                echo "Skipped (not found): $FILE"
+              fi
             done
 
-            if [ -z "$(ls -A "$WORKDIR")" ]; then
-              echo "No files downloaded for $VERSION, skipping release"
+            if [ "${#UPLOADS[@]}" -eq 0 ]; then
+              echo "No valid files for $VERSION, skipping release"
               rm -rf "$WORKDIR"
               continue
             fi
 
-            gh release create "$VERSION" "$WORKDIR"/* \
+            gh release create "$VERSION" "${UPLOADS[@]}" \
               --title "MikroTik RouterOS $VERSION" \
               --notes "Official MikroTik RouterOS $VERSION archive"
 
