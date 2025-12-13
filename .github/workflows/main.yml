@@ -1,4 +1,4 @@
-name: Mikrotik RouterOS Release Archive
+name: Mikrotik RouterOS Release Archive ROS
 
 on:
   workflow_dispatch:
