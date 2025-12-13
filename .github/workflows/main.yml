@@ -1,4 +1,4 @@
-name: Mikrotik RouterOS Release Archive ROS
+name: Mikrotik RouterOS Release Archive
 
 on:
   workflow_dispatch:
@@ -42,6 +42,10 @@ jobs:
         run: |
           FILES=(
             "CHANGELOG"
+            "chr-VERSION-arm64.img.zip"
+            "chr-VERSION.img.zip"
+            "chr-VERSION.ova"
+            "chr-VERSION.vmdk.zip"
             "all_packages-arm-VERSION.zip"
             "all_packages-arm64-VERSION.zip"
             "all_packages-mipsbe-VERSION.zip"
