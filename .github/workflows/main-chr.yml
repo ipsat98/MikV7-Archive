@@ -36,7 +36,7 @@ jobs:
           echo "Versions to process:"
           cat versions.txt
 
-      - name: Download files and create releases
+      - name: Download files and create/update releases
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -51,11 +51,6 @@ jobs:
             echo "=============================="
             echo "Processing RouterOS $VERSION"
             echo "=============================="
-
-            if gh release view "$VERSION" >/dev/null 2>&1; then
-              echo "Release $VERSION already exists, skipping"
-              continue
-            fi
 
             BASE_URL="https://download.mikrotik.com/routeros/$VERSION"
             WORKDIR="$(mktemp -d)"
@@ -84,9 +79,14 @@ jobs:
               continue
             fi
 
-            gh release create "$VERSION" "${UPLOADS[@]}" \
-              --title "MikroTik RouterOS $VERSION" \
-              --notes "Official MikroTik RouterOS $VERSION archive"
+            if gh release view "$VERSION" >/dev/null 2>&1; then
+              echo "Release $VERSION exists, uploading new files"
+              gh release upload "$VERSION" "${UPLOADS[@]}" --clobber
+            else
+              gh release create "$VERSION" "${UPLOADS[@]}" \
+                --title "MikroTik RouterOS $VERSION" \
+                --notes "Official MikroTik RouterOS $VERSION archive"
+            fi
 
             rm -rf "$WORKDIR"
 
