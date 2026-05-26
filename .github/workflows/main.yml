@@ -19,27 +19,31 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 240
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Normalize version list
+        shell: bash
         run: |
-          echo "${{ inputs.versions }}" \
+          printf '%s\n' "${{ inputs.versions }}" \
             | tr ', ' '\n' \
-            | sed '/^\s*$/d' \
+            | sed '/^[[:space:]]*$/d' \
             | sort -u > versions.txt
 
           echo "Versions to process:"
           cat versions.txt
 
       - name: Download files and create releases
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -Eeuo pipefail
+
           FILES=(
             "CHANGELOG"
             "chr-VERSION-arm64.img.zip"
@@ -81,7 +85,8 @@ jobs:
             "wireless-VERSION-tile.npk"
           )
 
-          while read VERSION; do
+          while IFS= read -r VERSION; do
+
             echo "=============================="
             echo "Processing RouterOS $VERSION"
             echo "=============================="
@@ -92,14 +97,27 @@ jobs:
             fi
 
             BASE_URL="https://download.mikrotik.com/routeros/$VERSION"
+
             WORKDIR="$(mktemp -d)"
+            trap 'rm -rf "$WORKDIR"' EXIT
+
             UPLOADS=()
 
             for f in "${FILES[@]}"; do
+
               FILE="${f/VERSION/$VERSION}"
               TARGET="$WORKDIR/$FILE"
 
-              if curl -fsL "$BASE_URL/$FILE" -o "$TARGET"; then
+              echo "Checking: $FILE"
+
+              if curl \
+                --fail \
+                --location \
+                --silent \
+                --show-error \
+                "$BASE_URL/$FILE" \
+                --output "$TARGET"; then
+
                 if [ -s "$TARGET" ]; then
                   UPLOADS+=("$TARGET")
                   echo "Downloaded: $FILE"
@@ -107,20 +125,25 @@ jobs:
                   rm -f "$TARGET"
                   echo "Skipped (empty): $FILE"
                 fi
+
               else
                 echo "Skipped (not found): $FILE"
               fi
+
             done
 
             if [ "${#UPLOADS[@]}" -eq 0 ]; then
-              echo "No valid files for $VERSION, skipping release"
+              echo "No valid files found for $VERSION"
               rm -rf "$WORKDIR"
               continue
             fi
 
-            gh release create "$VERSION" "${UPLOADS[@]}" \
+            gh release create "$VERSION" \
+              "${UPLOADS[@]}" \
               --title "MikroTik RouterOS $VERSION" \
               --notes "Official MikroTik RouterOS $VERSION archive"
+
+            echo "Release created: $VERSION"
 
             rm -rf "$WORKDIR"
 
