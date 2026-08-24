@@ -37,7 +37,7 @@ jobs:
           echo "Versions to repair:"
           cat versions.txt
 
-      - name: Repair missing files
+      - name: Download missing files with Resume
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -85,7 +85,7 @@ jobs:
             "wireless-VERSION-tile.npk"
           )
 
-          MAX_RETRIES=5
+          MAX_RETRIES=10
 
           while IFS= read -r VERSION; do
 
@@ -93,10 +93,6 @@ jobs:
             echo "=========================================="
             echo "Repairing RouterOS $VERSION"
             echo "=========================================="
-
-            # --------------------------------------------------
-            # Check whether release exists
-            # --------------------------------------------------
 
             if ! gh release view "$VERSION" >/dev/null 2>&1; then
               echo "Release $VERSION does not exist."
@@ -106,10 +102,6 @@ jobs:
 
             echo "Release $VERSION found."
 
-            # --------------------------------------------------
-            # Get existing assets
-            # --------------------------------------------------
-
             EXISTING="$(
               gh release view "$VERSION" \
                 --json assets \
@@ -117,12 +109,8 @@ jobs:
             )"
 
             echo
-            echo "Existing files:"
+            echo "Existing files in release:"
             echo "$EXISTING"
-
-            # --------------------------------------------------
-            # Temporary directory
-            # --------------------------------------------------
 
             WORKDIR="$(mktemp -d)"
 
@@ -136,52 +124,68 @@ jobs:
 
             BASE_URL="https://download.mikrotik.com/routeros/$VERSION"
 
-            # --------------------------------------------------
-            # Check every expected file
-            # --------------------------------------------------
-
             for f in "${FILES[@]}"; do
 
               FILE="${f/VERSION/$VERSION}"
               TARGET="$WORKDIR/$FILE"
+              URL="$BASE_URL/$FILE"
 
               echo
-              echo "------------------------------------------"
+              echo "=========================================="
               echo "Checking: $FILE"
-              echo "------------------------------------------"
+              echo "=========================================="
 
               # ------------------------------------------------
-              # Skip files already present in GitHub Release
+              # File already exists in GitHub Release
               # ------------------------------------------------
 
               if printf '%s\n' "$EXISTING" | grep -Fxq "$FILE"; then
-                echo "Already exists in release: $FILE"
+                echo "Already exists in release."
+                echo "Skipping download."
                 continue
               fi
 
-              echo "Missing from release: $FILE"
-
-              URL="$BASE_URL/$FILE"
-
-              # ------------------------------------------------
-              # Retry download
-              # ------------------------------------------------
+              echo "Missing from release."
+              echo "URL: $URL"
 
               SUCCESS=0
+
+              # ------------------------------------------------
+              # Resume download
+              # ------------------------------------------------
 
               for attempt in $(seq 1 "$MAX_RETRIES"); do
 
                 echo
+                echo "------------------------------------------"
                 echo "Download attempt $attempt/$MAX_RETRIES"
-                echo "$URL"
+                echo "------------------------------------------"
 
-                rm -f "$TARGET"
+                if [ -f "$TARGET" ]; then
+                  CURRENT_SIZE=$(stat -c%s "$TARGET")
+
+                  if [ "$CURRENT_SIZE" -gt 0 ]; then
+                    echo "Partial file found:"
+                    echo "Current size: $CURRENT_SIZE bytes"
+                    echo "Resuming download..."
+                  fi
+                else
+                  CURRENT_SIZE=0
+                  echo "Starting download from zero..."
+                fi
+
+                # ------------------------------------------------
+                # curl -C -
+                #
+                # If TARGET is incomplete, continue from its size.
+                # If TARGET doesn't exist, start from zero.
+                # ------------------------------------------------
 
                 if curl \
                   --fail \
                   --location \
                   --show-error \
-                  --retry 0 \
+                  --continue-at - \
                   --connect-timeout 30 \
                   --max-time 1800 \
                   --output "$TARGET" \
@@ -189,27 +193,37 @@ jobs:
 
                   if [ -s "$TARGET" ]; then
                     SUCCESS=1
-                    echo "Downloaded successfully: $FILE"
+                    echo
+                    echo "Download completed successfully:"
+                    echo "$FILE"
                     break
-                  else
-                    echo "Downloaded file is empty."
-                    rm -f "$TARGET"
                   fi
 
+                  echo "Downloaded file is empty."
                 else
-                  echo "Download failed."
+                  echo
+                  echo "Connection/download failed."
+
+                  if [ -f "$TARGET" ]; then
+                    PARTIAL_SIZE=$(stat -c%s "$TARGET")
+                    echo "Partial file remains:"
+                    echo "$PARTIAL_SIZE bytes"
+                    echo "Next attempt will RESUME from this point."
+                  fi
                 fi
 
                 if [ "$attempt" -lt "$MAX_RETRIES" ]; then
                   WAIT=$((attempt * 10))
-                  echo "Waiting ${WAIT}s before retry..."
+
+                  echo
+                  echo "Waiting ${WAIT} seconds before retry..."
                   sleep "$WAIT"
                 fi
 
               done
 
               # ------------------------------------------------
-              # Download successful
+              # Successful download
               # ------------------------------------------------
 
               if [ "$SUCCESS" -eq 1 ]; then
@@ -218,37 +232,27 @@ jobs:
               fi
 
               # ------------------------------------------------
-              # Final check using HTTP HEAD
+              # Failed after all retries
               # ------------------------------------------------
 
               echo
-              echo "All download attempts failed."
-              echo "Checking whether file actually exists..."
+              echo "FAILED after $MAX_RETRIES attempts:"
+              echo "$FILE"
 
-              if curl \
-                --head \
-                --fail \
-                --location \
-                --silent \
-                --show-error \
-                --connect-timeout 30 \
-                "$URL" >/dev/null 2>&1; then
+              if [ -f "$TARGET" ]; then
+                FINAL_SIZE=$(stat -c%s "$TARGET")
 
-                echo "WARNING: File exists on MikroTik server"
-                echo "but download failed: $FILE"
+                echo "Incomplete file size:"
+                echo "$FINAL_SIZE bytes"
 
-              else
-
-                echo "File not available on MikroTik server:"
-                echo "$FILE"
-
+                rm -f "$TARGET"
               fi
 
             done
 
-            # --------------------------------------------------
-            # Upload missing files
-            # --------------------------------------------------
+            # ----------------------------------------------------
+            # Upload successfully downloaded files
+            # ----------------------------------------------------
 
             if [ "${#UPLOADS[@]}" -eq 0 ]; then
 
@@ -267,7 +271,7 @@ jobs:
             echo "=========================================="
 
             for FILE in "${UPLOADS[@]}"; do
-              echo "Uploading: $(basename "$FILE")"
+              echo "Upload: $(basename "$FILE")"
             done
 
             gh release upload "$VERSION" \
