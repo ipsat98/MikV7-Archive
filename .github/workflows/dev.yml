@@ -1,0 +1,133 @@
+name: Add MikroTik Dev Files
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "RouterOS version"
+        required: true
+        type: string
+        default: "7.1"
+
+permissions:
+  contents: write
+
+jobs:
+  upload:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download and upload dev files
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEV_SERVER: ${{ secrets.DEV_SERVER }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -Eeuo pipefail
+
+          echo "=========================================="
+          echo " MikroTik RouterOS Dev Files"
+          echo "=========================================="
+          echo "Version: $VERSION"
+          echo "=========================================="
+
+          if [ -z "$DEV_SERVER" ]; then
+            echo "ERROR: DEV_SERVER secret is not configured"
+            exit 1
+          fi
+
+          BASE_URL="${DEV_SERVER%/}"
+
+          WORKDIR="$(mktemp -d)"
+
+          cleanup() {
+            rm -rf "$WORKDIR"
+          }
+
+          trap cleanup EXIT
+
+          FILES=(
+            "chr-${VERSION}-legacy-bios.img-dev.zip"
+            "chr-${VERSION}.img-dev.zip"
+            "all_packages-x86-${VERSION}-dev.zip"
+          )
+
+          echo
+          echo "Checking GitHub Release: $VERSION"
+
+          if ! gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "ERROR: Release $VERSION does not exist."
+            echo "Please create the official release first."
+            exit 1
+          fi
+
+          echo "Release $VERSION found."
+          echo
+
+          UPLOADS=()
+
+          for FILE in "${FILES[@]}"; do
+
+            URL="${BASE_URL}/${FILE}"
+            TARGET="${WORKDIR}/${FILE}"
+
+            echo "------------------------------------------"
+            echo "Downloading:"
+            echo "$FILE"
+            echo "URL: $URL"
+            echo "------------------------------------------"
+
+            if curl \
+              --fail \
+              --location \
+              --silent \
+              --show-error \
+              --retry 3 \
+              --connect-timeout 15 \
+              --output "$TARGET" \
+              "$URL"; then
+
+              if [ -s "$TARGET" ]; then
+                SIZE=$(du -h "$TARGET" | cut -f1)
+
+                echo "Downloaded successfully: $FILE"
+                echo "Size: $SIZE"
+
+                UPLOADS+=("$TARGET")
+              else
+                echo "ERROR: File is empty: $FILE"
+                exit 1
+              fi
+
+            else
+              echo "ERROR: Download failed:"
+              echo "$URL"
+              exit 1
+            fi
+
+          done
+
+          echo
+          echo "=========================================="
+          echo "Uploading files to GitHub Release $VERSION"
+          echo "=========================================="
+
+          gh release upload "$VERSION" \
+            "${UPLOADS[@]}" \
+            --clobber
+
+          echo
+          echo "=========================================="
+          echo "Completed successfully"
+          echo "=========================================="
+
+          echo
+          echo "Uploaded files:"
+          for FILE in "${FILES[@]}"; do
+            echo " - $FILE"
+          done
