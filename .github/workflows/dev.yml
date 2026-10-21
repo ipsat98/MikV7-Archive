@@ -52,8 +52,8 @@ jobs:
           trap cleanup EXIT
 
           FILES=(
-            #"chr-${VERSION}-legacy-bios.img-dev.zip"
-            #"chr-${VERSION}.img-dev.zip"
+            "chr-${VERSION}-legacy-bios.img-dev.zip"
+            "chr-${VERSION}.img-dev.zip"
             "all_packages-x86-${VERSION}-dev.zip"
           )
 
