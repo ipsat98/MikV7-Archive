@@ -1,0 +1,334 @@
+#!/bin/bash
+set -e
+
+_ask() {
+	local _redo=0
+	read resp
+	case "$resp" in
+	!)	echo "Type 'exit' to return to setup."
+		sh
+		_redo=1
+		;;
+	!*)	eval "${resp#?}"
+		_redo=1
+		;;
+	esac
+	return $_redo
+}
+ask() {
+	local _question="$1" _default="$2"
+	while :; do
+		printf %s "$_question "
+		[ -z "$_default" ] || printf "[%s] " "$_default"
+		_ask && : ${resp:=$_default} && break
+	done
+}
+ask_until() {
+	resp=
+	while [ -z "$resp" ] ; do
+		ask "$1" "$2"
+	done
+}
+yesno() {
+	case $1 in
+	[Yy]) return 0;;
+	esac
+	return 1
+}
+ask_yesno() {
+	while true; do
+		ask "$1" "$2"
+		case "$resp" in
+			Y|y|N|n) break;;
+		esac
+	done
+	yesno "$resp"
+}
+
+# ---------- Messages ----------
+MSG_ARCH="Arch:"
+MSG_BOOTMODE="BootMode:"
+MSG_STORAGE_DEVICE="Input storage device name:"
+MSG_ADDRESS="Input IP address:"
+MSG_GATEWAY="Input gateway:"
+MSG_DNS="Input domain name server:"
+MSG_UNSUPPORTED_ARCH="Error: Unsupported architecture: "
+MSG_SELECTED_VERSION="Selected version:"
+MSG_FILE_DOWNLOAD="Download file: "
+MSG_DOWNLOAD_ERROR="Error: No wget nor curl is installed. Cannot download."
+MSG_EXTRACT_ERROR="Error: No unzip nor gunzip is installed. Cannot uncompress."
+MSG_DOWNLOAD_FAILED="Error: Download failed!"
+MSG_OPERATION_ABORTED="Error: Operation aborted."
+MSG_WARNING="Warn: All data on /dev/%s will be lost!"
+MSG_REBOOTING="Ok, rebooting..."
+MSG_ADMIN_PASSWORD="admin password:"
+MSG_ERROR_MOUNT="Error: Failed to mount partition"
+MSG_ERROR_LOOP="Error: Failed to setup loop device"
+MSG_AUTO_RUN_FILE_CREATED="autorun.scr file created."
+MSG_AUTO_RUN_FILE_NOT_CREATED="Warn: autorun.scr file create failed"
+MSG_CONFIRM_CONTINUE="Do you want to continue? [y/n]"
+
+select_source() {
+    while true; do
+        echo ""
+        echo "=============================="
+        echo "   Select License / Source"
+        echo "=============================="
+        echo "1. mikrotik.com [official]     => (active for online & you email)"
+        echo "2. mikrotik.ltd [elseif patch] => (active auto license)"
+        echo "3. routeros.ltd [elseif patch] => (active for online & user-pass : 1)"
+        echo "4. ipsat patch  [personal]     => (It’s not recommended)"
+        echo "=============================="
+        ask_until "Please choose an option" "1"
+        case $resp in
+            1)
+                SOURCE_NAME="mikrotik.com"
+                VERSION_URL="https://upgrade.mikrotik.com"
+                IMG_BASE="https://download.mikrotik.com/routeros"
+                PATCH_MODE="official"
+                break
+                ;;
+            2)
+                SOURCE_NAME="mikrotik.ltd"
+                VERSION_URL="https://upgrade.mikrotik.ltd"
+                IMG_BASE="https://github.com/elseif/MikroTikPatch/releases/download"
+                PATCH_MODE="patch"
+                break
+                ;;
+            3)
+                SOURCE_NAME="routeros.ltd"
+                VERSION_URL="https://upgrade.routeros.ltd"
+                IMG_BASE="https://upgrade.routeros.ltd/routeros"
+                PATCH_MODE="online"
+                break
+                ;;
+            4)
+                SOURCE_NAME="ipsat patch"
+                VERSION_URL="https://upgrade.mikrotik.ltd"
+                IMG_BASE="https://github.com/ipsat98/MikV7-Archive/releases/download"
+                PATCH_MODE="ipsat"
+                break
+                ;;
+            *)
+                echo "Error: Invalid option!"
+                continue
+                ;;
+        esac
+    done
+    echo "Selected source: $SOURCE_NAME"
+}
+
+show_system_info() {
+    ARCH=$(uname -m)
+    BOOT_MODE=$( [ -d "/sys/firmware/efi" ] && echo "UEFI" || echo "BIOS" )
+    echo "$MSG_ARCH $ARCH"
+    echo "$MSG_BOOTMODE $BOOT_MODE"
+}
+
+confirm_storge() {
+    if command -v lsblk >/dev/null 2>&1; then
+        STORAGE=$(lsblk -d -n -o NAME,TYPE | awk '$2=="disk"{print $1; exit}')
+    else
+        STORAGE=$(fdisk -l | awk '/^Disk \/dev/ {print $2; exit}' | sed 's#:##' | sed 's#/dev/##')
+    fi
+    ask_until "$MSG_STORAGE_DEVICE" "$STORAGE"
+    STORAGE=$resp
+}
+
+confirm_address() {
+    ETH=$(ip route show default | grep '^default' | sed -n 's/.* dev \([^\ ]*\) .*/\1/p')
+    ADDRESS=$(ip addr show $ETH | grep global | cut -d' ' -f 6 | head -n 1)
+    GATEWAY=$(ip route list | grep default | cut -d' ' -f 3)
+    if [ -f "/etc/resolv.conf" ]; then
+        DNS=$(grep '^nameserver' /etc/resolv.conf | awk '{print $2}' | head -n 1)
+    fi
+    [ -z "$DNS" ] && DNS="8.8.8.8"
+    ask_until "$MSG_ADDRESS" "$ADDRESS"
+    ADDRESS=$resp
+    ask_until "$MSG_GATEWAY" "$GATEWAY"
+    GATEWAY=$resp
+    ask_until "$MSG_DNS" "$DNS"
+    DNS=$resp
+}
+
+http_get() {
+    local url=$1
+    local dest_file=$2
+    if command -v curl >/dev/null 2>&1; then
+        if [ -z "$dest_file" ]; then
+            curl -Ls "$url"
+        else
+            curl -L -# -o "$dest_file" "$url" || { echo "$MSG_DOWNLOAD_FAILED"; exit 1; }
+        fi
+    elif command -v wget >/dev/null 2>&1; then
+        if [ -z "$dest_file" ]; then
+            wget --no-check-certificate -qO- "$url"
+        else
+            wget --no-check-certificate -O "$dest_file" "$url" || { echo "$MSG_DOWNLOAD_FAILED"; exit 1; }
+        fi
+    else
+        echo "$MSG_DOWNLOAD_ERROR"
+        exit 1
+    fi
+}
+
+extract_zip() {
+    local zip_file=$1
+    local dest_file=$2
+    if command -v unzip >/dev/null 2>&1; then
+        unzip -p "$zip_file" > "$dest_file" || { echo "$MSG_EXTRACT_ERROR"; exit 1; }
+    elif command -v gunzip >/dev/null 2>&1; then
+        gunzip -c "$zip_file" > "$dest_file" || { echo "$MSG_EXTRACT_ERROR"; exit 1; }
+    else
+        echo "$MSG_EXTRACT_ERROR"
+        exit 1
+    fi
+}
+
+select_version() {
+    if [[ -n "$VERSION" ]]; then
+        :
+    else
+        ask_until "Enter version to install (example: 7.25.1)" ""
+        VERSION=$resp
+    fi
+
+    if [[ "$VERSION" == 7.* ]]; then
+        V7=1
+    else
+        V7=0
+    fi
+
+    echo "$MSG_SELECTED_VERSION $VERSION"
+}
+
+download_image(){
+    case $PATCH_MODE in
+        official)
+            case $ARCH in
+                x86_64|i386|i486|i586|i686)
+                    IMG_URL="$IMG_BASE/$VERSION/chr-$VERSION.img.zip"
+                    ;;
+                aarch64)
+                    IMG_URL="$IMG_BASE/$VERSION/chr-$VERSION-arm64.img.zip"
+                    ;;
+                *)
+                    echo "$MSG_UNSUPPORTED_ARCH"
+                    exit 1
+                    ;;
+            esac
+            ;;
+        patch)
+            case $ARCH in
+                x86_64|i386|i486|i586|i686)
+                    if [[ $V7 == 1 && $BOOT_MODE == "BIOS" ]]; then
+                        IMG_URL="$IMG_BASE/$VERSION/chr-$VERSION-legacy-bios.img.zip"
+                    else
+                        IMG_URL="$IMG_BASE/$VERSION/chr-$VERSION.img.zip"
+                    fi
+                    ;;
+                aarch64)
+                    IMG_URL="$IMG_BASE/$VERSION-arm64/chr-$VERSION-arm64.img.zip"
+                    ;;
+                *)
+                    echo "$MSG_UNSUPPORTED_ARCH"
+                    exit 1
+                    ;;
+            esac
+            ;;
+        online)
+            case $ARCH in
+                x86_64|i386|i486|i586|i686)
+                    if [[ $V7 == 1 && $BOOT_MODE == "BIOS" ]]; then
+                        IMG_URL="$IMG_BASE/$VERSION/chr-$VERSION-legacy-bios.img.zip"
+                    else
+                        IMG_URL="$IMG_BASE/$VERSION/chr-$VERSION.img.zip"
+                    fi
+                    ;;
+                aarch64)
+                    IMG_URL="$IMG_BASE/$VERSION/chr-$VERSION-arm64.img.zip"
+                    ;;
+                *)
+                    echo "$MSG_UNSUPPORTED_ARCH"
+                    exit 1
+                    ;;
+            esac
+            ;;
+        ipsat)
+            case $ARCH in
+                x86_64|i386|i486|i586|i686)
+                    if [[ $V7 == 1 && $BOOT_MODE == "BIOS" ]]; then
+                        IMG_URL="$IMG_BASE/$VERSION/chr-$VERSION-legacy-bios.img-dev.zip"
+                    else
+                        IMG_URL="$IMG_BASE/$VERSION/chr-$VERSION.img-dev.zip"
+                    fi
+                    ;;
+                aarch64)
+                    IMG_URL="https://github.com/elseif/MikroTikPatch/releases/download/$VERSION-arm64/chr-$VERSION-arm64.img.zip"
+                    ;;
+                *)
+                    echo "$MSG_UNSUPPORTED_ARCH"
+                    exit 1
+                    ;;
+            esac
+            ;;
+    esac
+    echo "$MSG_FILE_DOWNLOAD $(basename "$IMG_URL")"
+    http_get "$IMG_URL" "/tmp/chr.img.zip"
+    cd /tmp
+    extract_zip "chr.img.zip" chr.img
+}
+
+create_autorun() {
+    if LOOP=$(losetup -Pf --show chr.img 2>/dev/null); then
+        sleep 1
+        MNT=/tmp/chr
+        mkdir -p $MNT
+        PARTITION=$([ "$V7" == 1 ] && echo "p2" || echo "p1")
+        if mount "${LOOP}${PARTITION}" "$MNT" 2>/dev/null; then
+            confirm_address
+            RANDOM_ADMIN_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 6)
+            ask_until "$MSG_ADMIN_PASSWORD" "$RANDOM_ADMIN_PASS"
+            RANDOM_ADMIN_PASS=$resp
+            cat <<EOF > "$MNT/rw/autorun.scr"
+/user set admin password="$RANDOM_ADMIN_PASS"
+/ip dns set servers=$DNS
+/ip address add address=$ADDRESS interface=ether1
+/ip route add gateway=$GATEWAY
+EOF
+            echo "$MSG_AUTO_RUN_FILE_CREATED"
+            umount $MNT
+            losetup -d "$LOOP"
+        else
+            losetup -d "$LOOP"
+            echo "$MSG_ERROR_MOUNT $PARTITION"
+            echo "$MSG_AUTO_RUN_FILE_NOT_CREATED"
+        fi
+    else
+        echo "$MSG_ERROR_LOOP"
+        echo "$MSG_AUTO_RUN_FILE_NOT_CREATED"
+    fi
+}
+
+write_and_reboot() {
+	confirm_storge
+    printf "$MSG_WARNING\n" "$STORAGE"
+    ask_yesno "$MSG_CONFIRM_CONTINUE"
+    if [ $? -ne 0 ]; then
+        echo "$MSG_OPERATION_ABORTED"
+        exit 1
+    fi
+    dd if=chr.img of=/dev/$STORAGE bs=4M conv=fsync
+    echo "$MSG_REBOOTING"
+    echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
+    echo b > /proc/sysrq-trigger 2>/dev/null || true
+    reboot -f
+}
+
+select_source
+show_system_info
+select_version
+download_image
+create_autorun
+write_and_reboot
+exit 0

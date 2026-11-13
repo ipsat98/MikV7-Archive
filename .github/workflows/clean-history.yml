@@ -1,0 +1,44 @@
+name: clean-history
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  clean-history:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clean commit history but keep files with original dates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GIT_USER_NAME: ${{ secrets.GIT_USER_NAME }}
+          GIT_USER_EMAIL: ${{ secrets.GIT_USER_EMAIL }}
+        run: |
+          git config --global user.email "$GIT_USER_EMAIL"
+          git config --global user.name "$GIT_USER_NAME"
+          
+          LAST_COMMIT_DATE=$(git log -1 --format=%cd)
+          echo "Last commit date: $LAST_COMMIT_DATE"
+          
+          git checkout --orphan temp-main
+          
+          git add .
+          
+          git commit -m "Upload file" --date="$LAST_COMMIT_DATE"
+          
+          git branch -D main || true
+          
+          git branch -m main
+          
+          git push --force origin main
+          
+          echo "✅ Commit history cleared successfully!"
+          echo "📁 All files have been preserved with original dates"
+          

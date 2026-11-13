@@ -1,0 +1,286 @@
+name: Repair Mikrotik RouterOS Release Archive
+
+on:
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: |
+          RouterOS versions to repair
+          Example:
+          7.24.1
+          7.23.3
+          7.19.6
+          (space, comma or newline separated)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Normalize version list
+        shell: bash
+        run: |
+          printf '%s\n' "${{ inputs.versions }}" \
+            | tr ', ' '\n' \
+            | sed '/^[[:space:]]*$/d' \
+            | sort -u > versions.txt
+
+          echo "Versions to repair:"
+          cat versions.txt
+
+      - name: Download missing files with Resume
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+
+          FILES=(
+            "CHANGELOG"
+            "chr-VERSION-arm64.img.zip"
+            "chr-VERSION.img.zip"
+            "chr-VERSION.ova"
+            "chr-VERSION.vmdk.zip"
+            "all_packages-arm-VERSION.zip"
+            "all_packages-arm64-VERSION.zip"
+            "all_packages-mipsbe-VERSION.zip"
+            "all_packages-mmips-VERSION.zip"
+            "all_packages-ppc-VERSION.zip"
+            "all_packages-smips-VERSION.zip"
+            "all_packages-tile-VERSION.zip"
+            "all_packages-x86-VERSION.zip"
+            "btest.exe"
+            "dude-install-VERSION.exe"
+            "flashfig.exe"
+            "install-image-VERSION.zip"
+            "mikrotik-VERSION.iso"
+            "mikrotik-VERSION-arm64.iso"
+            "mikrotik.mib"
+            "netinstall-VERSION.tar.gz"
+            "netinstall-VERSION.zip"
+            "netinstall64-VERSION.zip"
+            "routeros-VERSION.npk"
+            "routeros-VERSION-arm.npk"
+            "routeros-VERSION-arm64.npk"
+            "routeros-VERSION-mipsbe.npk"
+            "routeros-VERSION-mmips.npk"
+            "routeros-VERSION-ppc.npk"
+            "routeros-VERSION-smips.npk"
+            "routeros-VERSION-tile.npk"
+            "wireless-VERSION-arm.npk"
+            "wireless-VERSION-arm64.npk"
+            "wireless-VERSION-mipsbe.npk"
+            "wireless-VERSION-mmips.npk"
+            "wireless-VERSION-ppc.npk"
+            "wireless-VERSION-smips.npk"
+            "wireless-VERSION-tile.npk"
+          )
+
+          MAX_RETRIES=10
+
+          while IFS= read -r VERSION; do
+
+            echo
+            echo "=========================================="
+            echo "Repairing RouterOS $VERSION"
+            echo "=========================================="
+
+            if ! gh release view "$VERSION" >/dev/null 2>&1; then
+              echo "Release $VERSION does not exist."
+              echo "Skipping..."
+              continue
+            fi
+
+            echo "Release $VERSION found."
+
+            EXISTING="$(
+              gh release view "$VERSION" \
+                --json assets \
+                --jq '.assets[].name'
+            )"
+
+            echo
+            echo "Existing files in release:"
+            echo "$EXISTING"
+
+            WORKDIR="$(mktemp -d)"
+
+            cleanup() {
+              rm -rf "$WORKDIR"
+            }
+
+            trap cleanup EXIT
+
+            UPLOADS=()
+
+            BASE_URL="https://download.mikrotik.com/routeros/$VERSION"
+
+            for f in "${FILES[@]}"; do
+
+              FILE="${f/VERSION/$VERSION}"
+              TARGET="$WORKDIR/$FILE"
+              URL="$BASE_URL/$FILE"
+
+              echo
+              echo "=========================================="
+              echo "Checking: $FILE"
+              echo "=========================================="
+
+              # ------------------------------------------------
+              # File already exists in GitHub Release
+              # ------------------------------------------------
+
+              if printf '%s\n' "$EXISTING" | grep -Fxq "$FILE"; then
+                echo "Already exists in release."
+                echo "Skipping download."
+                continue
+              fi
+
+              echo "Missing from release."
+              echo "URL: $URL"
+
+              SUCCESS=0
+
+              # ------------------------------------------------
+              # Resume download
+              # ------------------------------------------------
+
+              for attempt in $(seq 1 "$MAX_RETRIES"); do
+
+                echo
+                echo "------------------------------------------"
+                echo "Download attempt $attempt/$MAX_RETRIES"
+                echo "------------------------------------------"
+
+                if [ -f "$TARGET" ]; then
+                  CURRENT_SIZE=$(stat -c%s "$TARGET")
+
+                  if [ "$CURRENT_SIZE" -gt 0 ]; then
+                    echo "Partial file found:"
+                    echo "Current size: $CURRENT_SIZE bytes"
+                    echo "Resuming download..."
+                  fi
+                else
+                  CURRENT_SIZE=0
+                  echo "Starting download from zero..."
+                fi
+
+                # ------------------------------------------------
+                # curl -C -
+                #
+                # If TARGET is incomplete, continue from its size.
+                # If TARGET doesn't exist, start from zero.
+                # ------------------------------------------------
+
+                if curl \
+                  --fail \
+                  --location \
+                  --show-error \
+                  --continue-at - \
+                  --connect-timeout 30 \
+                  --max-time 1800 \
+                  --output "$TARGET" \
+                  "$URL"; then
+
+                  if [ -s "$TARGET" ]; then
+                    SUCCESS=1
+                    echo
+                    echo "Download completed successfully:"
+                    echo "$FILE"
+                    break
+                  fi
+
+                  echo "Downloaded file is empty."
+                else
+                  echo
+                  echo "Connection/download failed."
+
+                  if [ -f "$TARGET" ]; then
+                    PARTIAL_SIZE=$(stat -c%s "$TARGET")
+                    echo "Partial file remains:"
+                    echo "$PARTIAL_SIZE bytes"
+                    echo "Next attempt will RESUME from this point."
+                  fi
+                fi
+
+                if [ "$attempt" -lt "$MAX_RETRIES" ]; then
+                  WAIT=$((attempt * 10))
+
+                  echo
+                  echo "Waiting ${WAIT} seconds before retry..."
+                  sleep "$WAIT"
+                fi
+
+              done
+
+              # ------------------------------------------------
+              # Successful download
+              # ------------------------------------------------
+
+              if [ "$SUCCESS" -eq 1 ]; then
+                UPLOADS+=("$TARGET")
+                continue
+              fi
+
+              # ------------------------------------------------
+              # Failed after all retries
+              # ------------------------------------------------
+
+              echo
+              echo "FAILED after $MAX_RETRIES attempts:"
+              echo "$FILE"
+
+              if [ -f "$TARGET" ]; then
+                FINAL_SIZE=$(stat -c%s "$TARGET")
+
+                echo "Incomplete file size:"
+                echo "$FINAL_SIZE bytes"
+
+                rm -f "$TARGET"
+              fi
+
+            done
+
+            # ----------------------------------------------------
+            # Upload successfully downloaded files
+            # ----------------------------------------------------
+
+            if [ "${#UPLOADS[@]}" -eq 0 ]; then
+
+              echo
+              echo "=========================================="
+              echo "Nothing to upload for $VERSION"
+              echo "=========================================="
+
+              continue
+            fi
+
+            echo
+            echo "=========================================="
+            echo "Uploading ${#UPLOADS[@]} file(s)"
+            echo "to release $VERSION"
+            echo "=========================================="
+
+            for FILE in "${UPLOADS[@]}"; do
+              echo "Upload: $(basename "$FILE")"
+            done
+
+            gh release upload "$VERSION" \
+              "${UPLOADS[@]}" \
+              --clobber=false
+
+            echo
+            echo "=========================================="
+            echo "Repair completed for $VERSION"
+            echo "=========================================="
+
+          done < versions.txt
